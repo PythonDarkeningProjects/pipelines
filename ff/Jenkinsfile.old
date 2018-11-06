@@ -1,0 +1,90 @@
+#!/usr/bin/env groovy
+// Pipeline is used in order to run intel-gpu-tools fastfeedback suite in all platforms
+// Jenkinsfile2 (Declarative Pipeline)
+
+def email_list = "some email"
+
+pipeline {
+
+    agent { label 'some agent' }
+
+    // The timeout is calculated using the worst case scenario for test execution.
+    // Assuming a platform is busy so the pipeline has to retry 5 times before being able
+    // to run the tests. Then considering the max time it would take a platform to run fastfeedback
+    // timeout = (5 times X 30 minutes) + 3 hours = 5.5 hours -> 6 hours
+    options {
+        timeout(time: 6, unit: 'HOURS')
+        disableConcurrentBuilds()
+    }
+
+    environment {
+        home = '/home/shared/build/f'
+        qa_repository = "${home}/gx-qa"
+        ff_home = "${home}/gx-qa/igt/suites/ff"
+    }
+
+    stages {
+        stage('preparing the environment'){
+            steps{
+                echo 'deleting ${qa_repository}'
+                sh 'rm -rf ${qa_repository}'
+                echo 'downloading gfx-qa-tools repository from github.com'
+                sh "git -C ${home} clone https://github.om/gx-qa.git"
+            }
+        }
+        stage('Deploy'){
+            steps{
+                echo "launching intel-gpu-tools fastfeedback in the selected platforms"
+                sh """
+                cd ${ff_home}
+                PYTHONPATH=/home/shared/gitlist/gfx-qa-tools python ff_orchestrator.py ${graphic_stack} ${kernel} ${firmware} ${visualization} -r ${reporting} ${dry_run}
+                """
+                // Retry up to 5 times the test execution on those platforms
+                // that were unavailable
+                script {
+                    int retry = 0
+                    int max_retry = 5
+                    while (fileExists("${ff_home}/platforms_not_launched.yml") && (retry < max_retry)) {
+                        retry+=1
+                        sleep time: 20, unit: 'MINUTES'
+                        sh """
+                        cd ${ff_home}
+                        PYTHONPATH=/home/shared/gitlist/gfx-qa-tools python ff_orchestrator.py --firmware --visualization --report prod --grabsystemsbusy
+                        """
+                    }
+                    // If after all re-trying there are still platforms in the platforms_not_launched.yml
+                    // mark the build as Aborted and finish the pipeline.
+                    if (fileExists("${ff_home}/platforms_not_launched.yml")) {
+                        def data = readYaml file: "${ff_home}/platforms_not_launched.yml"
+                        currentBuild.result = 'ABORTED'
+                        error("failed to run intel-gpu-tools fastfeeback in the following platforms: ${data}")
+                    }
+                }
+            }
+        }
+
+    }
+
+    post {
+
+        always {
+            // This will always run
+            echo 'Deleting jenkins workspace'
+            deleteDir()
+        }
+        success {
+            // This will run only if successful
+            mail to: "${email_list}",
+            subject: "successful Pipeline: ${currentBuild.fullDisplayName}",
+            body: "The intel-gpu-tools fastfeedback ${env.BUILD_URL} was executed successfully"
+        }
+        failure {
+            // This will run only if failed
+            mail to: "${email_list}",
+            subject: "failed Pipeline: ${currentBuild.fullDisplayName}",
+            body: "Something went wrong with the intel-gpu-tools fastfeedback execution ${env.BUILD_URL}"
+        }
+
+    }
+
+}

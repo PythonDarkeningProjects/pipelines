@@ -1,0 +1,181 @@
+def email_from = 'some email'
+def email_to = 'some email'
+def email_cc = 'some email'
+
+pipeline {
+
+    agent none
+
+    environment {
+        // Global Variables
+        SERVER_USER = 'jenkins-slave'
+        SERVER_FOLDER = '/home/jenkins-slave/html/ISO/'
+        RSYNC_CMD = '-avzhe'
+        SSH_CMD = 'ssh -o StrictHostKeyChecking=no'
+        LOCAL_FOLDER_A = '/home/testing/ISOS/'
+        LOCAL_FOLDER_B = '/home/jalonso/Downloads/ISOS/'
+        TESTING_WORKSPACE = '/home/testing/jenkins_rsync'
+        JALONSO_WORKSPACE = '/home/jalonso/jenkins_rsync'
+        REPOSITORIES = '/tmp/rsync_repositories'
+        REQUIREMENTS_FILE = '${REPOSITORIES}/stx-test-suite-pipelines/tools/rsync/python/requirements.txt'
+        SCRIPT = "${REPOSITORIES}/stx-test-suite-pipelines/tools/rsync/python/download_files.py"
+        ISOS_TO_DOWNLOAD = '3'
+        VIRTUALENVWRAPPER = '/usr/local/bin/virtualenvwrapper.sh'
+        VIRTUAL_ENV_NAME = 'rsync'
+    }
+
+    options {
+        timeout(time: 40, unit: 'MINUTES')
+        disableConcurrentBuilds()
+    }
+
+    stages {
+        stage('Downloading ISOS'){
+            failFast true
+            parallel {
+                stage('Download ISOS'){
+                    agent {
+                        node {
+                            label 'some agent'
+                            customWorkspace ${TESTING_WORKSPACE}
+                        }
+                    }
+                    options {
+                        timeout(time: 20, unit: 'MINUTES')
+                        retry(2)
+                        timestamps()
+                    }
+                    steps{
+                        echo 'Cloning repositories'
+                        sh '''#!/bin/bash
+                        git -C ${REPOSITORIES} ${PIPELINES_REPO}
+                        '''
+                        echo 'Creating a virtual environment'
+                        sh '''#!/bin/bash
+                        source ${VIRTUALENVWRAPPER}
+                        mkvirtualenv ${VIRTUAL_ENV_NAME}
+                        '''
+                        echo 'Installing dependencies on virtual environment'
+                        sh '''#!/bin/bash
+                        source ${VIRTUALENVWRAPPER}
+                        workon ${VIRTUAL_ENV_NAME}
+                        pip install -r ${REQUIREMENTS_FILE}
+                        '''
+                        echo "Downloading ISOS from ${SERVER_IP}"
+                        sh '''#!/bin/bash
+                        source ${VIRTUALENVWRAPPER}
+                        workon ${VIRTUAL_ENV_NAME}
+                        python ${SCRIPT} --number ${ISOS_TO_DOWNLOAD} --f ${LOCAL_FOLDER_A} --verbose
+                        '''
+                        echo 'Deleting virtual environment'
+                        sh '''#!/bin/bash
+                        source ${VIRTUALENVWRAPPER}
+                        rmvirtualenv ${VIRTUAL_ENV_NAME}
+                        '''
+                    }
+                    post {
+                        always {
+                            echo 'Deleting jenkins workspace'
+                            deleteDir()
+                        }
+                        failure {
+                            mail to: "${email_list}",
+                            subject: "failed Pipeline: ${currentBuild.fullDisplayName}",
+                            body: "Something went wrong downloading the ISOS"
+                        }
+                    }
+                }
+                stage('Download ISOS to STX-Workstation'){
+                    agent {
+                        node {
+                            label 'STX Workstation'
+                            customWorkspace ${JALONSO_WORKSPACE}
+                        }
+                    }
+                    options {
+                        timeout(time: 20, unit: 'MINUTES')
+                        retry(2)
+                        timestamps()
+                    }
+                    environment {
+                        // Stage Environment Variables
+                        LATEST_ISO_FILE = "${LOCAL_FOLDER_B}/.LATEST_ISO"
+                        CONTROL_FILE = "${LOCAL_FOLDER_B}/.CONTROL"
+                        JOB_TO_BUILD = 'dummy job'
+                    }
+                    steps{
+                        echo 'Cloning repositories'
+                        sh '''#!/bin/bash
+                        git -C ${REPOSITORIES} ${PIPELINES_REPO}
+                        '''
+                        echo 'Creating a virtual environment'
+                        sh '''#!/bin/bash
+                        source ${VIRTUALENVWRAPPER}
+                        mkvirtualenv ${VIRTUAL_ENV_NAME}
+                        '''
+                        echo 'Installing dependencies on virtual environment'
+                        sh '''#!/bin/bash
+                        source ${VIRTUALENVWRAPPER}
+                        workon ${VIRTUAL_ENV_NAME}
+                        pip install -r ${REQUIREMENTS_FILE}
+                        '''
+                        echo "Getting local latest ISO"
+                        sh '''#!/bin/bash
+                        ls ${LOCAL_FOLDER_B} | grep -E "^stx" | grep -E "\\.iso$" | grep -Eiv "**centos**" | sort -u | tail -1 > ${LATEST_ISO_FILE}
+                        '''
+                        echo "Downloading ISOS from ${SERVER_IP}"
+                        sh '''#!/bin/bash
+                        python ${SCRIPT} --number ${ISOS_TO_DOWNLOAD} --f ${LOCAL_FOLDER_B} --verbose
+                        '''
+                        echo "Making a comparasion of local iso vs downloaded iso (if any)"
+                        sh '''#!/bin/bash
+                        LOCAL_ISO=$(cat ${LATEST_ISO_FILE})
+                        LATEST_ISO=$(ls ${LOCAL_FOLDER_B} | grep -E "^stx" | grep -E "\\.iso$" | grep -Eiv "**centos**" | sort -u | tail -1)
+
+                        if [[ ${LOCAL_ISO} != ${LATEST_ISO} ]]; then
+                            echo "BUILD" > ${CONTROL_FILE}
+                        elif [[ ${OLD_ISO} == ${LATEST_ISO} ]]; then
+                            echo "NOT_BUILD" > ${CONTROL_FILE}
+                        fi
+                        '''
+                        echo 'Deleting virtual environment'
+                        sh '''#!/bin/bash
+                        source ${VIRTUALENVWRAPPER}
+                        rmvirtualenv ${VIRTUAL_ENV_NAME}
+                        '''
+                        script {
+                            BUILD = readFile(CONTROL_FILE).trim()
+                            echo "BUILD: ${BUILD}"
+                            if (BUILD == "BUILD") {
+                                echo "Building the job: ${JOB_TO_BUILD}"
+                                build job: JOB_TO_BUILD, wait: false
+                                mail to: "${email_to}",
+                                cc: "${email_cc}",
+                                from: "${email_from}",
+                                subject: "Job trigerred: ${JOB_TO_BUILD} from ${currentBuild.fullDisplayName}",
+                                body: "A new ISO was downloaded for the node STX Workstation and the jenkins job: ${currentBuild.fullDisplayName} was triggered a new built for - ${JOB_TO_BUILD}"
+                            }
+                            else {
+                                echo "The job: ${JOB_TO_BUILD} will not built"
+                            }
+                        }
+                    }
+                    post {
+                        // valid conditions are [always, changed, fixed, regression, aborted, success, unstable, failure, notBuilt, cleanup]
+                        always {
+                            echo 'Deleting jenkins workspace for: STX-Workstation'
+                            deleteDir()
+                        }
+                        failure {
+                            mail to: "${email_to}",
+                            cc: "${email_cc}",
+                            from: "${email_from}",
+                            subject: "Failed Pipeline: ${currentBuild.fullDisplayName}",
+                            body: "Something went wrong downloading the ISOS"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
